@@ -1,5 +1,8 @@
 /**
- * Telegram webhook: anyone sends a TikTok link, the owner receives the video via DM.
+ * Telegram webhook with two modes:
+ * - Bot chat: anyone sends the bot a TikTok link, the owner receives the video via DM.
+ * - Business chat: someone sends a TikTok link to the owner's personal DMs, and the bot
+ *   (connected via Telegram Business) replies in that chat with the video.
  *
  * Telegram POSTs each update here. We acknowledge immediately and do the slow work
  * (download + upload) in `waitUntil`, so Telegram never times out and re-sends the update.
@@ -28,11 +31,20 @@ interface TelegramMessage {
   from?: TelegramUser;
   text?: string;
   caption?: string;
+  business_connection_id?: string;
 }
 
 interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
+  business_message?: TelegramMessage;
+}
+
+interface BusinessConnection {
+  id: string;
+  user: TelegramUser;
+  is_enabled: boolean;
+  rights?: { can_reply?: boolean };
 }
 
 export interface TikTokVideo {
@@ -76,11 +88,25 @@ function editMessage(chatId: number, messageId: number, text: string) {
   return callTelegram("editMessageText", { chat_id: chatId, message_id: messageId, text });
 }
 
-function sendVideo(chatId: number, video: Uint8Array<ArrayBuffer>, caption: string) {
+interface SendVideoOptions {
+  caption?: string;
+  replyTo?: number;
+  businessConnectionId?: string;
+}
+
+function sendVideo(chatId: number, video: Uint8Array<ArrayBuffer>, options: SendVideoOptions = {}) {
   const form = new FormData();
   form.append("chat_id", String(chatId));
-  form.append("caption", caption);
-  form.append("parse_mode", "HTML");
+  if (options.caption) {
+    form.append("caption", options.caption);
+    form.append("parse_mode", "HTML");
+  }
+  if (options.replyTo) {
+    form.append("reply_parameters", JSON.stringify({ message_id: options.replyTo }));
+  }
+  if (options.businessConnectionId) {
+    form.append("business_connection_id", options.businessConnectionId);
+  }
   form.append("supports_streaming", "true");
   form.append("video", new Blob([video], { type: "video/mp4" }), "tiktok.mp4");
   return callTelegram("sendVideo", form);
@@ -171,8 +197,54 @@ export async function getTikTokVideo(url: string): Promise<TikTokVideo> {
 // ---------------------------------------------------------------------------
 
 async function handleUpdate(update: TelegramUpdate): Promise<void> {
-  const message = update.message;
-  if (!message) return;
+  if (update.business_message) return handleBusinessMessage(update.business_message);
+  if (update.message) return handleBotMessage(update.message);
+}
+
+/**
+ * A message in one of the owner's personal chats. Replies in that chat with the video,
+ * as the owner. Stays silent on anything that isn't a TikTok link so normal DMs are untouched.
+ */
+async function handleBusinessMessage(message: TelegramMessage): Promise<void> {
+  const connectionId = message.business_connection_id;
+  const urls = (message.text ?? message.caption ?? "").match(TIKTOK_URL_RE) ?? [];
+  if (!connectionId || urls.length === 0) return;
+
+  const ownerId = Number(env("OWNER_CHAT_ID"));
+  // Only convert links others send to the owner, not links the owner sends out.
+  if (message.from?.id === ownerId) return;
+
+  // Anyone with Telegram Premium could connect this bot to their own account;
+  // only serve the owner's connection.
+  const connection = await callTelegram<BusinessConnection>("getBusinessConnection", {
+    business_connection_id: connectionId,
+  });
+  if (connection.user.id !== ownerId || !connection.is_enabled) return;
+
+  for (const url of urls) {
+    try {
+      const video = await getTikTokVideo(url);
+      if (video.data.byteLength > MAX_UPLOAD_BYTES) {
+        throw new Error("Video exceeds Telegram's 50 MB bot upload limit");
+      }
+      await sendVideo(message.chat.id, video.data, {
+        replyTo: message.message_id,
+        businessConnectionId: connectionId,
+      });
+    } catch (error) {
+      console.error(`Failed to process business link ${url}:`, error);
+      await sendMessage(
+        ownerId,
+        `⚠️ Couldn't convert a link ${describeSender(message.from)} sent you:\n${escapeHtml(url)}\n<code>${escapeHtml(
+          String((error as Error).message ?? error).slice(0, 500),
+        )}</code>`,
+      );
+    }
+  }
+}
+
+/** A message sent directly to the bot: forward the video to the owner. */
+async function handleBotMessage(message: TelegramMessage): Promise<void> {
 
   const chatId = message.chat.id;
   const text = message.text ?? message.caption ?? "";
@@ -199,7 +271,7 @@ async function handleUpdate(update: TelegramUpdate): Promise<void> {
       if (video.data.byteLength > MAX_UPLOAD_BYTES) {
         throw new Error("Video exceeds Telegram's 50 MB bot upload limit");
       }
-      await sendVideo(ownerId, video.data, `From ${sender}\n${escapeHtml(url)}`);
+      await sendVideo(ownerId, video.data, { caption: `From ${sender}\n${escapeHtml(url)}` });
       await editMessage(chatId, status.message_id, isOwner ? "Done ✅" : "Sent ✅ Thanks!");
     } catch (error) {
       console.error(`Failed to process ${url}:`, error);
