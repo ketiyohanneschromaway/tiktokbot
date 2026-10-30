@@ -1,0 +1,17 @@
+{
+  "name": "tiktokbot",
+  "private": true,
+  "type": "module",
+  "description": "Telegram bot that forwards TikTok videos to the owner",
+  "scripts": {
+    "typecheck": "tsc",
+    "set-webhook": "node --env-file=.env scripts/set-webhook.ts"
+  },
+  "dependencies": {
+    "@vercel/functions": "^3.10.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}
