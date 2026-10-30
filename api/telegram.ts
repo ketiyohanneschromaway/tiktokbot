@@ -13,6 +13,10 @@ import { waitUntil } from "@vercel/functions";
 // Telegram Bot API upload limit for bots using the public API server.
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
+// Keeps captions under Telegram's 1024-character limit and messages under 4096.
+const MAX_CAPTION_COMMENT_LENGTH = 800;
+const MAX_MESSAGE_COMMENT_LENGTH = 3500;
+
 const TIKTOK_URL_RE = /https?:\/\/(?:www\.|vm\.|vt\.|m\.)?tiktok\.com\/[^\s]+/gi;
 
 const USER_AGENT =
@@ -114,6 +118,10 @@ function sendVideo(chatId: number, video: Uint8Array<ArrayBuffer>, options: Send
 
 function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function truncate(text: string, maxLength: number): string {
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
 function describeSender(user?: TelegramUser): string {
@@ -252,17 +260,37 @@ async function handleBotMessage(message: TelegramMessage): Promise<void> {
   const isOwner = message.from?.id === ownerId;
 
   if (text.startsWith("/start")) {
-    await sendMessage(chatId, "Send me a TikTok link and I'll pass it along.");
+    await sendMessage(
+      chatId,
+      "Send me a TikTok link and I'll pass it along. Feel free to add a comment, or just send a comment on its own.",
+    );
     return;
   }
 
   const urls = text.match(TIKTOK_URL_RE) ?? [];
+  // Whatever the sender wrote besides the links is treated as their comment.
+  const comment = text.replace(TIKTOK_URL_RE, "").trim();
+  const sender = describeSender(message.from);
+
   if (urls.length === 0) {
-    await sendMessage(chatId, "That doesn't look like a TikTok link.", message.message_id);
+    if (!comment) {
+      await sendMessage(chatId, "Send me a TikTok link or a comment.", message.message_id);
+    } else if (isOwner) {
+      await sendMessage(chatId, "That doesn't look like a TikTok link.", message.message_id);
+    } else {
+      await sendMessage(
+        ownerId,
+        `💬 Comment from ${sender}:\n${escapeHtml(truncate(comment, MAX_MESSAGE_COMMENT_LENGTH))}`,
+      );
+      await sendMessage(chatId, "Thanks for your comment! 💬", message.message_id);
+    }
     return;
   }
 
-  const sender = describeSender(message.from);
+  const commentLine = comment
+    ? `\n\n💬 ${escapeHtml(truncate(comment, MAX_CAPTION_COMMENT_LENGTH))}`
+    : "";
+  const thanks = comment ? "Sent ✅ Thanks for sharing, and for the comment! 💬" : "Sent ✅ Thanks!";
 
   for (const url of urls) {
     const status = await sendMessage(chatId, "Downloading…", message.message_id);
@@ -271,8 +299,8 @@ async function handleBotMessage(message: TelegramMessage): Promise<void> {
       if (video.data.byteLength > MAX_UPLOAD_BYTES) {
         throw new Error("Video exceeds Telegram's 50 MB bot upload limit");
       }
-      await sendVideo(ownerId, video.data, { caption: `From ${sender}\n${escapeHtml(url)}` });
-      await editMessage(chatId, status.message_id, isOwner ? "Done ✅" : "Sent ✅ Thanks!");
+      await sendVideo(ownerId, video.data, { caption: `From ${sender}\n${escapeHtml(url)}${commentLine}` });
+      await editMessage(chatId, status.message_id, isOwner ? "Done ✅" : thanks);
     } catch (error) {
       console.error(`Failed to process ${url}:`, error);
       await editMessage(chatId, status.message_id, "Sorry, I couldn't get that video.");
